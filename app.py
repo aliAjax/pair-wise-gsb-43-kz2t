@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -54,10 +55,32 @@ def canonical_hash(value: Any) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+GENESIS_HASH = "0" * 64
+
+
+def chain_node_hash(seq: int, tender_id: int | None, bid_id: int | None, evaluation_id: int | None,
+                    evaluation_round: int, batch_id: str, event_type: str, payload: str, prev_hash: str) -> str:
+    """摘要链节点哈希：覆盖序号、采购项目、投标、评分、批次、事件类型、报文和前序哈希。"""
+    return canonical_hash({
+        "seq": seq,
+        "tender_id": tender_id,
+        "bid_id": bid_id,
+        "evaluation_id": evaluation_id,
+        "evaluation_round": evaluation_round,
+        "batch_id": batch_id,
+        "event_type": event_type,
+        "payload": payload,
+        "prev_hash": prev_hash,
+    })
+
+
 class ProcurementService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
         self._init_schema()
+        self._migrate_chain()
+        # 服务重启时自检摘要链：可修复的半写节点先修复，无法修复的置为阻断授标
+        self.startup_chain_status = self.verify_chain(repair=True)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -162,8 +185,33 @@ class ProcurementService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS score_chain (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER,
+                    bid_id INTEGER,
+                    evaluation_id INTEGER,
+                    evaluation_round INTEGER NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL DEFAULT '',
+                    prev_hash TEXT NOT NULL DEFAULT '',
+                    hash TEXT,
+                    status TEXT NOT NULL DEFAULT 'valid',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS chain_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    tip_seq INTEGER NOT NULL DEFAULT 0,
+                    tip_hash TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'ok',
+                    break_seq INTEGER,
+                    break_reason TEXT,
+                    updated_at TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_chain_eval ON score_chain(evaluation_id);
+                CREATE INDEX IF NOT EXISTS idx_chain_tender_round ON score_chain(tender_id,evaluation_round);
                 """
             )
 
@@ -173,6 +221,176 @@ class ProcurementService:
             "INSERT INTO timeline(tender_id,actor,action,details,created_at) VALUES(?,?,?,?,?)",
             (tender_id, actor, action, json.dumps(details, ensure_ascii=False, sort_keys=True), utcnow()),
         )
+
+    def _append_chain(self, conn: sqlite3.Connection, *, tender_id: int | None, bid_id: int | None,
+                      evaluation_id: int | None, evaluation_round: int, batch_id: str, event_type: str,
+                      payload_obj: dict[str, Any], status: str = "valid") -> dict[str, Any]:
+        """向连续摘要链追加一个节点，并推进链末端状态。必须与业务写入处于同一事务。"""
+        tip = conn.execute("SELECT seq,hash FROM score_chain ORDER BY seq DESC LIMIT 1").fetchone()
+        prev_hash = tip["hash"] if tip else GENESIS_HASH
+        seq = (tip["seq"] if tip else 0) + 1
+        payload_text = json.dumps(payload_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = chain_node_hash(seq, tender_id, bid_id, evaluation_id, evaluation_round,
+                                 batch_id, event_type, payload_text, prev_hash)
+        conn.execute(
+            """INSERT INTO score_chain(seq,tender_id,bid_id,evaluation_id,evaluation_round,batch_id,
+                                       event_type,payload,prev_hash,hash,status,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (seq, tender_id, bid_id, evaluation_id, evaluation_round, batch_id,
+             event_type, payload_text, prev_hash, digest, status, utcnow()),
+        )
+        conn.execute("UPDATE chain_state SET tip_seq=?,tip_hash=?,updated_at=? WHERE id=1",
+                     (seq, digest, utcnow()))
+        return {"seq": seq, "hash": digest}
+
+    def _migrate_chain(self) -> None:
+        """升级补链：为没有摘要节点的历史评分按主键顺序补链。
+
+        只插入链节点，不覆盖 evaluations 原值；投标或采购项目无法确认的记录标记 pending（待核）。
+        """
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()}
+            if "status" not in columns:
+                conn.execute("ALTER TABLE evaluations ADD COLUMN status TEXT NOT NULL DEFAULT 'valid'")
+            conn.execute(
+                "INSERT OR IGNORE INTO chain_state(id,tip_seq,tip_hash,status,updated_at) VALUES(1,0,?,'ok',?)",
+                (GENESIS_HASH, utcnow()),
+            )
+            rows = conn.execute("SELECT * FROM evaluations ORDER BY id").fetchall()
+            for row in rows:
+                chained = conn.execute(
+                    "SELECT 1 FROM score_chain WHERE evaluation_id=? AND event_type='score'", (row["id"],)
+                ).fetchone()
+                if chained:
+                    continue
+                bid = conn.execute("SELECT * FROM bids WHERE id=?", (row["bid_id"],)).fetchone()
+                tender = conn.execute("SELECT * FROM tenders WHERE id=?", (bid["tender_id"],)).fetchone() if bid else None
+                if not bid or not tender:
+                    status, tender_id = "pending", bid["tender_id"] if bid else None
+                elif row["evaluation_round"] < tender["evaluation_round"]:
+                    status, tender_id = "voided", bid["tender_id"]
+                else:
+                    status, tender_id = "valid", bid["tender_id"]
+                self._append_chain(
+                    conn,
+                    tender_id=tender_id,
+                    bid_id=row["bid_id"],
+                    evaluation_id=row["id"],
+                    evaluation_round=row["evaluation_round"],
+                    batch_id="legacy-%d" % row["id"],
+                    event_type="score",
+                    payload_obj={"evaluator": row["evaluator"], "criterion": row["criterion"],
+                                 "raw_value": row["raw_value"], "score": row["score"],
+                                 "comment": row["comment"], "legacy": True},
+                    status=status,
+                )
+
+    def verify_chain(self, repair: bool = False, actor: str = "system") -> dict[str, Any]:
+        """校验摘要链完整性；repair=True 时修复可修复节点，无法修复的置为阻断授标。"""
+        with self.connect() as conn:
+            if repair:
+                conn.execute("BEGIN IMMEDIATE")
+            nodes = [dict(r) for r in conn.execute("SELECT * FROM score_chain ORDER BY seq").fetchall()]
+            prev = GENESIS_HASH
+            repairs: list[tuple[int, str, str]] = []
+            break_info: dict[str, Any] | None = None
+            rounds: dict[int, dict[str, Any]] = {}
+            seq_round: dict[int, int] = {}
+            for node in nodes:
+                seq_round[node["seq"]] = node["evaluation_round"]
+                agg = rounds.setdefault(node["evaluation_round"],
+                                        {"round": node["evaluation_round"], "nodes": 0,
+                                         "valid": 0, "voided": 0, "pending": 0, "events": 0})
+                agg["nodes"] += 1
+                if node["event_type"] == "void":
+                    agg["events"] += 1
+                elif node["status"] in {"valid", "voided", "pending"}:
+                    agg[node["status"]] += 1
+                try:
+                    payload_ok = bool(node["payload"]) and json.loads(node["payload"]) is not None
+                except (TypeError, ValueError):
+                    payload_ok = False
+                if not payload_ok:
+                    break_info = {"seq": node["seq"], "reason": "链节点数据残缺，无法确认原始内容"}
+                    break
+                fixed_prev = node["prev_hash"] or ""
+                need_fix = fixed_prev != prev
+                if need_fix:
+                    fixed_prev = prev
+                expected = chain_node_hash(node["seq"], node["tender_id"], node["bid_id"], node["evaluation_id"],
+                                           node["evaluation_round"], node["batch_id"], node["event_type"],
+                                           node["payload"], fixed_prev)
+                fixed_hash = node["hash"] or ""
+                if fixed_hash != expected:
+                    fixed_hash = expected
+                    need_fix = True
+                if need_fix:
+                    repairs.append((node["seq"], fixed_prev, fixed_hash))
+                prev = fixed_hash
+            if break_info is None and repairs:
+                break_info = {"seq": repairs[0][0], "reason": "链节点哈希缺失或与内容不匹配"}
+            tip_seq = nodes[-1]["seq"] if nodes else 0
+            tip_hash = prev if nodes else GENESIS_HASH
+            state = conn.execute("SELECT * FROM chain_state WHERE id=1").fetchone()
+            if break_info is None and (state["tip_seq"] != tip_seq or state["tip_hash"] != tip_hash):
+                break_info = {"seq": tip_seq, "reason": "链末端状态与节点不一致"}
+            unrepairable = break_info is not None and "无法确认" in break_info["reason"]
+            repaired = 0
+            if repair:
+                if unrepairable:
+                    conn.execute(
+                        "UPDATE chain_state SET status='blocked',break_seq=?,break_reason=?,updated_at=? WHERE id=1",
+                        (break_info["seq"], break_info["reason"], utcnow()),
+                    )
+                    self._audit(conn, None, actor, "chain.blocked", dict(break_info))
+                    status = "blocked"
+                else:
+                    if repairs:
+                        for seq, fixed_prev, fixed_hash in repairs:
+                            conn.execute("UPDATE score_chain SET prev_hash=?,hash=? WHERE seq=?",
+                                         (fixed_prev, fixed_hash, seq))
+                        repaired = len(repairs)
+                        self._audit(conn, None, actor, "chain.repaired",
+                                    {"from_seq": repairs[0][0], "repaired_nodes": repaired})
+                    conn.execute(
+                        "UPDATE chain_state SET tip_seq=?,tip_hash=?,status='ok',break_seq=NULL,break_reason=NULL,updated_at=? WHERE id=1",
+                        (tip_seq, tip_hash, utcnow()),
+                    )
+                    break_info = None
+                    status = "ok"
+            else:
+                persisted = state["status"]
+                if unrepairable or persisted == "blocked":
+                    status = "blocked"
+                elif break_info is not None:
+                    status = "broken"
+                else:
+                    status = "ok"
+            break_round = seq_round.get(break_info["seq"]) if break_info else None
+            round_list = []
+            for rnd in sorted(rounds):
+                agg = rounds[rnd]
+                round_status = "ok"
+                if break_round == rnd:
+                    round_status = "broken"
+                elif agg["pending"]:
+                    round_status = "pending"
+                round_list.append({**agg, "status": round_status})
+            return {
+                "status": status,
+                "total_nodes": len(nodes),
+                "tip": {"seq": tip_seq, "hash": tip_hash},
+                "break_at": break_info,
+                "rounds": round_list,
+                "repaired": repaired,
+                "checked_at": utcnow(),
+            }
+
+    def repair_chain(self, actor: str, role: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor", "auditor"}, "修复评分摘要链")
+        return self.verify_chain(repair=True, actor=actor)
 
     def _tender(self, conn: sqlite3.Connection, tender_id: int) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM tenders WHERE id=?", (tender_id,)).fetchone()
@@ -353,7 +571,8 @@ class ProcurementService:
         if not evaluator.strip() or not reason.strip():
             raise DomainError("评审人和冲突原因不能为空")
         with self.connect() as conn:
-            self._tender(conn, tender_id)
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
             try:
                 cur = conn.execute(
                     "INSERT INTO conflicts(tender_id,evaluator,vendor_id,reason,declared_by,created_at) VALUES(?,?,?,?,?,?)",
@@ -361,11 +580,53 @@ class ProcurementService:
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("利益冲突已申报", 409) from exc
-            self._audit(conn, tender_id, actor, "conflict.declared", {"evaluator": evaluator.strip(), "vendor_id": vendor_id, "reason": reason.strip()})
-            return dict(conn.execute("SELECT * FROM conflicts WHERE id=?", (cur.lastrowid,)).fetchone())
+            conflict_id = cur.lastrowid
+            # 已授标项目的快照保持冻结；未授标的，该评审人当前轮评分失效作废、排名重算
+            frozen = tender["status"] in {"awarded", "cancelled"}
+            voided: list[int] = []
+            if not frozen:
+                if vendor_id is not None:
+                    bid_ids = [r["id"] for r in conn.execute(
+                        "SELECT id FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchall()]
+                else:
+                    bid_ids = [r["id"] for r in conn.execute(
+                        "SELECT id FROM bids WHERE tender_id=?", (tender_id,)).fetchall()]
+                if bid_ids:
+                    marks = ",".join("?" for _ in bid_ids)
+                    rows = conn.execute(
+                        "SELECT id FROM evaluations WHERE evaluator=? AND evaluation_round=? AND status='valid' AND bid_id IN (%s)" % marks,
+                        (evaluator.strip(), tender["evaluation_round"], *bid_ids),
+                    ).fetchall()
+                    now = utcnow()
+                    for row in rows:
+                        conn.execute("UPDATE evaluations SET status='voided',updated_at=? WHERE id=?", (now, row["id"]))
+                        conn.execute("UPDATE score_chain SET status='voided' WHERE evaluation_id=? AND event_type='score'", (row["id"],))
+                    voided = [row["id"] for row in rows]
+                    if voided:
+                        self._append_chain(
+                            conn,
+                            tender_id=tender_id,
+                            bid_id=None,
+                            evaluation_id=None,
+                            evaluation_round=tender["evaluation_round"],
+                            batch_id="VOID-CF-%d" % conflict_id,
+                            event_type="void",
+                            payload_obj={"source": "conflict", "source_id": conflict_id,
+                                         "evaluator": evaluator.strip(), "vendor_id": vendor_id,
+                                         "round": tender["evaluation_round"],
+                                         "voided_evaluation_ids": voided, "reason": reason.strip()},
+                        )
+            self._audit(conn, tender_id, actor, "conflict.declared", {
+                "evaluator": evaluator.strip(), "vendor_id": vendor_id, "reason": reason.strip(),
+                "voided_evaluation_ids": voided, "snapshot_frozen": frozen,
+            })
+            result = dict(conn.execute("SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone())
+            result["voided_evaluation_ids"] = voided
+            result["snapshot_frozen"] = frozen
+            return result
 
     def evaluate_bid(self, actor: str, role: str, bid_id: int, values: dict[str, float],
-                     comment: str = "") -> dict[str, Any]:
+                     comment: str = "", expected_round: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"evaluator"}, "评分")
         with self.connect() as conn:
@@ -376,6 +637,8 @@ class ProcurementService:
             tender = self._tender(conn, bid["tender_id"])
             if tender["status"] not in {"opened", "reevaluation"} or tender["evaluations_locked"]:
                 raise DomainError("当前项目不能评分", 409)
+            if expected_round is not None and int(expected_round) != tender["evaluation_round"]:
+                raise DomainError("评分轮次已变化：投诉处理已生效，请按最新轮次重新评分", 409)
             if bid["status"] not in {"opened", "qualified"}:
                 raise DomainError("该投标不能评分", 409)
             conflict = conn.execute(
@@ -389,7 +652,9 @@ class ProcurementService:
             if missing:
                 raise DomainError("缺少评分项: " + ",".join(missing))
             created = []
+            chain_nodes = []
             now = utcnow()
+            batch_id = "R%d-%s" % (tender["evaluation_round"], uuid.uuid4().hex[:12])
             for criterion in criteria:
                 try:
                     raw = float(values[criterion["name"]])
@@ -413,9 +678,28 @@ class ProcurementService:
                        VALUES(?,?,?,?,?,?,?,?,?)""",
                     (bid_id, tender["evaluation_round"], actor, criterion["name"], raw, score, comment.strip(), now, now),
                 )
-                created.append(dict(conn.execute("SELECT * FROM evaluations WHERE id=?", (cur.lastrowid,)).fetchone()))
-            self._audit(conn, tender["id"], actor, "bid.evaluated", {"bid_id": bid_id, "criteria": [item["criterion"] for item in created]})
-            return {"bid_id": bid_id, "evaluator": actor, "round": tender["evaluation_round"], "evaluations": created}
+                evaluation_id = cur.lastrowid
+                chain_nodes.append(self._append_chain(
+                    conn,
+                    tender_id=tender["id"],
+                    bid_id=bid_id,
+                    evaluation_id=evaluation_id,
+                    evaluation_round=tender["evaluation_round"],
+                    batch_id=batch_id,
+                    event_type="score",
+                    payload_obj={"evaluator": actor, "criterion": criterion["name"], "raw_value": raw,
+                                 "score": score, "comment": comment.strip()},
+                ))
+                created.append(dict(conn.execute("SELECT * FROM evaluations WHERE id=?", (evaluation_id,)).fetchone()))
+            # 评分也是项目变更：推进版本，使并发的投诉处理能按先提交事务为准、另一方 409
+            conn.execute("UPDATE tenders SET version=version+1,updated_at=? WHERE id=?", (now, tender["id"]))
+            self._audit(conn, tender["id"], actor, "bid.evaluated", {
+                "bid_id": bid_id, "batch_id": batch_id,
+                "criteria": [item["criterion"] for item in created],
+                "chain_seqs": [node["seq"] for node in chain_nodes],
+            })
+            return {"bid_id": bid_id, "evaluator": actor, "round": tender["evaluation_round"],
+                    "batch_id": batch_id, "evaluations": created, "chain": chain_nodes}
 
     def disqualify_bid(self, actor: str, role: str, bid_id: int, reason: str,
                        expected_version: int) -> dict[str, Any]:
@@ -487,7 +771,7 @@ class ProcurementService:
             return dict(conn.execute("SELECT * FROM complaints WHERE id=?", (cur.lastrowid,)).fetchone())
 
     def resolve_complaint(self, actor: str, role: str, complaint_id: int, decision: str,
-                          resolution: str) -> dict[str, Any]:
+                          resolution: str, expected_version: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "处理投诉")
         if decision not in {"accepted", "rejected"} or not resolution.strip():
@@ -503,20 +787,54 @@ class ProcurementService:
                 "UPDATE complaints SET status=?,resolution=?,reviewed_by=?,resolved_at=? WHERE id=?",
                 (decision, resolution.strip(), actor, utcnow(), complaint_id),
             )
+            voided: list[int] = []
             if decision == "accepted":
                 tender = self._tender(conn, complaint["tender_id"])
                 if tender["status"] in {"awarded", "cancelled"}:
                     raise DomainError("已结束项目不能重新评审", 409)
+                if expected_version is not None and tender["version"] != int(expected_version):
+                    raise DomainError("项目已变化，请刷新后重试", 409)
+                # 尚未授标：当前轮评分和排名失效作废，进入新一轮重评
+                rows = conn.execute(
+                    """SELECT e.id FROM evaluations e JOIN bids b ON b.id=e.bid_id
+                       WHERE b.tender_id=? AND e.evaluation_round=? AND e.status='valid'""",
+                    (tender["id"], tender["evaluation_round"]),
+                ).fetchall()
+                now = utcnow()
+                for row in rows:
+                    conn.execute("UPDATE evaluations SET status='voided',updated_at=? WHERE id=?", (now, row["id"]))
+                    conn.execute("UPDATE score_chain SET status='voided' WHERE evaluation_id=? AND event_type='score'", (row["id"],))
+                voided = [row["id"] for row in rows]
                 conn.execute(
                     "UPDATE tenders SET status='reevaluation',evaluation_round=evaluation_round+1,evaluations_locked=0,version=version+1,updated_at=? WHERE id=?",
-                    (utcnow(), tender["id"]),
+                    (now, tender["id"]),
                 )
-            self._audit(conn, complaint["tender_id"], actor, "complaint.resolved", {"complaint_id": complaint_id, "decision": decision})
-            return dict(conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone())
+                self._append_chain(
+                    conn,
+                    tender_id=tender["id"],
+                    bid_id=None,
+                    evaluation_id=None,
+                    evaluation_round=tender["evaluation_round"],
+                    batch_id="VOID-CMP-%d" % complaint_id,
+                    event_type="void",
+                    payload_obj={"source": "complaint", "source_id": complaint_id,
+                                 "round": tender["evaluation_round"],
+                                 "voided_evaluation_ids": voided, "resolution": resolution.strip()},
+                )
+            self._audit(conn, complaint["tender_id"], actor, "complaint.resolved", {
+                "complaint_id": complaint_id, "decision": decision, "voided_evaluation_ids": voided,
+            })
+            result = dict(conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone())
+            result["voided_evaluation_ids"] = voided
+            return result
 
     def award_tender(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "授标")
+        chain = self.verify_chain()
+        if chain["status"] != "ok":
+            seq = (chain["break_at"] or {}).get("seq", "?")
+            raise DomainError("评分摘要链存在断点(seq=%s)，授标已阻断，请先修复链" % seq, 409)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             tender = self._tender(conn, tender_id)
@@ -533,7 +851,7 @@ class ProcurementService:
             ranking = []
             for bid in bids:
                 rows = conn.execute(
-                    "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
+                    "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? AND status='valid' GROUP BY criterion",
                     (bid["id"], tender["evaluation_round"]),
                 ).fetchall()
                 scores = {row["criterion"]: row["score"] for row in rows}
@@ -547,7 +865,9 @@ class ProcurementService:
                 raise DomainError("没有可授标的有效投标", 409)
             ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
             winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            chain_tip = conn.execute("SELECT tip_hash FROM chain_state WHERE id=1").fetchone()["tip_hash"]
+            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner,
+                        "awarded_by": actor, "awarded_at": utcnow(), "chain_tip": chain_tip}
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
                 (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
@@ -676,6 +996,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", "service": "public-procurement"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path == "/api/chain/status":
+                self._send(200, self.service.verify_chain())
             elif path.startswith("/api/tenders/"):
                 self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
             else:
@@ -716,6 +1038,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.resolve_complaint(actor, role, **data)
             elif path == "/api/tenders/award":
                 result = self.service.award_tender(actor, role, **data)
+            elif path == "/api/chain/repair":
+                result = self.service.repair_chain(actor, role)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
